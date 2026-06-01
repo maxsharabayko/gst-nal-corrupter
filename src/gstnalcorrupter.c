@@ -37,6 +37,7 @@ typedef struct _GstNalCorrupter {
   guint max_nals_per_buffer;
   guint length_field_size;
   gboolean protect_config;
+  gboolean only_corrupt_slices;
   GstNalCorrupterMode mode;
 
   guint seed;
@@ -66,6 +67,7 @@ enum {
   PROP_BYTES_PER_NAL,
   PROP_MAX_NALS_PER_BUFFER,
   PROP_PROTECT_CONFIG,
+  PROP_ONLY_CORRUPT_SLICES,
   PROP_LENGTH_FIELD_SIZE,
   PROP_SEED
 };
@@ -123,6 +125,52 @@ is_config_nal(const GstNalCorrupter *self, const guint8 *nal, guint size)
       return is_h264_config_nal(nal[0]);
     case GST_NAL_CORRUPTER_CODEC_H265:
       return is_h265_config_nal(nal, size);
+    default:
+      return FALSE;
+  }
+}
+
+static gboolean
+is_h264_slice_nal(guint8 nal_header)
+{
+  guint8 nal_type = nal_header & 0x1f;
+  /* NAL types 1-5 are slice types:
+   * 1 = Non-IDR slice
+   * 2 = Slice data partition A
+   * 3 = Slice data partition B
+   * 4 = Slice data partition C
+   * 5 = IDR slice */
+  return nal_type >= 1 && nal_type <= 5;
+}
+
+static gboolean
+is_h265_slice_nal(const guint8 *nal, guint size)
+{
+  guint8 nal_type;
+
+  if (size < 2) {
+    return FALSE;
+  }
+
+  nal_type = (nal[0] >> 1) & 0x3f;
+  /* NAL types 0-9, 16-21 are slice types:
+   * 0-9 = Various slice types (TRAIL, TSA, STSA, RADL, RASL, etc.)
+   * 16-21 = IDR and CRA slices */
+  return (nal_type >= 0 && nal_type <= 9) || (nal_type >= 16 && nal_type <= 21);
+}
+
+static gboolean
+is_slice_nal(const GstNalCorrupter *self, const guint8 *nal, guint size)
+{
+  if (size == 0) {
+    return FALSE;
+  }
+
+  switch (self->codec) {
+    case GST_NAL_CORRUPTER_CODEC_H264:
+      return is_h264_slice_nal(nal[0]);
+    case GST_NAL_CORRUPTER_CODEC_H265:
+      return is_h265_slice_nal(nal, size);
     default:
       return FALSE;
   }
@@ -398,6 +446,10 @@ gst_nal_corrupter_transform_ip(GstBaseTransform *base, GstBuffer *buf)
       continue;
     }
 
+    if (self->only_corrupt_slices && !is_slice_nal(self, nal_data, nal->size)) {
+      continue;
+    }
+
     corrupt_nal_payload(self, nal_data, nal->size);
     corrupted++;
   }
@@ -432,6 +484,9 @@ gst_nal_corrupter_set_property(GObject *object, guint prop_id,
       break;
     case PROP_PROTECT_CONFIG:
       self->protect_config = g_value_get_boolean(value);
+      break;
+    case PROP_ONLY_CORRUPT_SLICES:
+      self->only_corrupt_slices = g_value_get_boolean(value);
       break;
     case PROP_LENGTH_FIELD_SIZE:
       self->length_field_size = g_value_get_uint(value);
@@ -469,6 +524,9 @@ gst_nal_corrupter_get_property(GObject *object, guint prop_id, GValue *value,
       break;
     case PROP_PROTECT_CONFIG:
       g_value_set_boolean(value, self->protect_config);
+      break;
+    case PROP_ONLY_CORRUPT_SLICES:
+      g_value_set_boolean(value, self->only_corrupt_slices);
       break;
     case PROP_LENGTH_FIELD_SIZE:
       g_value_set_uint(value, self->length_field_size);
@@ -533,6 +591,11 @@ gst_nal_corrupter_class_init(GstNalCorrupterClass *klass)
           "Do not corrupt codec configuration NALs", TRUE,
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
+  g_object_class_install_property(gobject_class, PROP_ONLY_CORRUPT_SLICES,
+      g_param_spec_boolean("only-corrupt-slices", "Only corrupt slices",
+          "Only corrupt slice NAL units (ignore all non-slice NALs)", FALSE,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
   g_object_class_install_property(gobject_class, PROP_LENGTH_FIELD_SIZE,
       g_param_spec_uint("length-field-size", "Length field size",
           "NAL length field size for avc/hvc1 streams (bytes)", 1, 4, 4,
@@ -574,6 +637,7 @@ gst_nal_corrupter_init(GstNalCorrupter *self)
   self->bytes_per_nal = 1;
   self->max_nals_per_buffer = 0;
   self->protect_config = TRUE;
+  self->only_corrupt_slices = FALSE;
   self->mode = GST_NAL_CORRUPTER_MODE_FLIP_BIT;
   self->length_field_size = 4;
   self->seed = 1;
